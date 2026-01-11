@@ -1,0 +1,282 @@
+﻿unit DcuCompileTimes.Core;
+
+interface
+
+uses
+  System.SysUtils,
+  System.Generics.Collections,
+  Winapi.Windows;
+
+type
+  TFileMeta = record
+    Path: String;
+    LastWriteTime: Int64;
+  end;
+
+  IFileProvider = interface
+    ['{E69751F8-E5C9-4B05-914F-32245439456C}']
+    function GetFiles(const ASearchPath, ASearchMask: string): TArray<TFileMeta>;
+  end;
+
+  TFileInfo = record
+    Path: String;
+    LastWriteTime: Int64;
+    Diff: Int64;
+  end;
+
+  TNamespaceInfo = record
+    TotalTime: Int64;
+    FileCount: Integer;
+  end;
+
+  TDcuAnalyzer = class
+  private
+    FFileList: TList<TFileInfo>;
+    FTotalDiff: Int64;
+    FMedian: Int64;
+    FOldestFile: TFileInfo;
+    FSearchPath: String;
+    FSearchMask: String;
+    FFileProvider: IFileProvider;
+  public
+    constructor Create(const ASearchPath: String; const ASearchMask: String = '*.dcu'; const AFileProvider: IFileProvider = nil);
+    destructor Destroy; override;
+    procedure Execute;
+    function GetNamespaceStats(const AFileList: TList<TFileInfo> = nil): TDictionary<string, TNamespaceInfo>;
+    function IsIncompleteBuild: Boolean;
+    property Files: TList<TFileInfo> read FFileList;
+    property TotalTime: Int64 read FTotalDiff;
+    property MedianTime: Int64 read FMedian;
+    property OldestFile: TFileInfo read FOldestFile;
+  end;
+
+const
+  TicksPerMillisecond = 10000;
+
+implementation
+
+uses
+  System.IOUtils,
+  System.Generics.Defaults,
+  System.Math,
+  System.DateUtils,
+  System.Types;
+
+{ TFileSystemFileProvider }
+
+type
+  TFileSystemFileProvider = class(TInterfacedObject, IFileProvider)
+  private
+    function GetFileLastWriteTime(const FilePath: String): TFileTime;
+    function FileTimeToLargeInteger(const FileTime: TFileTime): Int64;
+  public
+    function GetFiles(const ASearchPath, ASearchMask: string): TArray<TFileMeta>;
+  end;
+
+function TFileSystemFileProvider.FileTimeToLargeInteger(const FileTime: TFileTime): Int64;
+type
+  TULARGE_INTEGER = record
+    case Integer of
+      0: (LowPart: DWORD; HighPart: DWORD);
+      1: (QuadPart: Int64);
+  end;
+var
+  LI: TULARGE_INTEGER;
+begin
+  LI.LowPart := FileTime.dwLowDateTime;
+  LI.HighPart := FileTime.dwHighDateTime;
+  Result := LI.QuadPart;
+end;
+
+function TFileSystemFileProvider.GetFileLastWriteTime(const FilePath: String): TFileTime;
+var
+  FindData: TWin32FindData;
+  FindHandle: THandle;
+begin
+  FindHandle := FindFirstFile(PChar(FilePath), FindData);
+  if FindHandle <> INVALID_HANDLE_VALUE then
+  begin
+    Result := FindData.ftLastWriteTime;
+    FindClose(FindHandle);
+  end
+  else
+    RaiseLastOSError;
+end;
+
+function TFileSystemFileProvider.GetFiles(const ASearchPath, ASearchMask: string): TArray<TFileMeta>;
+var
+  FilePaths: TArray<string>;
+  I: Integer;
+  Meta: TFileMeta;
+begin
+  FilePaths := TDirectory.GetFiles(ASearchPath, ASearchMask);
+  SetLength(Result, Length(FilePaths));
+  for I := 0 to High(FilePaths) do
+  begin
+    Meta.Path := FilePaths[I];
+    Meta.LastWriteTime := FileTimeToLargeInteger(GetFileLastWriteTime(Meta.Path));
+    Result[I] := Meta;
+  end;
+end;
+
+{ TDcuAnalyzer }
+
+constructor TDcuAnalyzer.Create(const ASearchPath, ASearchMask: string; const AFileProvider: IFileProvider);
+begin
+  FSearchPath := ASearchPath;
+  FSearchMask := ASearchMask;
+  FFileList := TList<TFileInfo>.Create;
+  if Assigned(AFileProvider) then
+    FFileProvider := AFileProvider
+  else
+    FFileProvider := TFileSystemFileProvider.Create;
+end;
+
+destructor TDcuAnalyzer.Destroy;
+begin
+  FFileList.Free;
+  inherited;
+end;
+
+procedure TDcuAnalyzer.Execute;
+var
+  CurrentFile: TFileInfo;
+  FileInfo   : TFileInfo;
+  FileMetas  : TArray<TFileMeta>;
+  MidIndex   : Integer;
+begin
+  FFileList.Clear;
+  FTotalDiff := 0;
+  FMedian := 0;
+
+  FileMetas := FFileProvider.GetFiles(FSearchPath, FSearchMask);
+
+  for var Meta in FileMetas do
+  begin
+    FileInfo.Path := Meta.Path;
+    FileInfo.LastWriteTime := Meta.LastWriteTime;
+    FileInfo.Diff := 0;
+    FFileList.Add(FileInfo);
+  end;
+
+  if FFileList.Count = 0 then
+    Exit;
+
+  // Sort by last write time (descending, so oldest is last)
+  FFileList.Sort(
+    TComparer<TFileInfo>.Construct(
+      function(const Left, Right: TFileInfo): Integer
+      begin
+        Result := Sign(Right.LastWriteTime - Left.LastWriteTime);
+      end));
+
+  if FFileList.Count > 0 then
+    FOldestFile := FFileList.Last; // Store the oldest file before further sorting
+
+  FTotalDiff := 0;
+  for var Loop: Integer := 0 to FFileList.Count - 2 do
+  begin
+    CurrentFile := FFileList[Loop];
+    CurrentFile.Diff := Abs(FFileList[Loop].LastWriteTime - FFileList[Loop+1].LastWriteTime);
+    FFileList[Loop] := CurrentFile;
+    FTotalDiff := FTotalDiff + CurrentFile.Diff;
+  end;
+
+  // Sort by diff (descending) to calculate median
+  var TempList := TList<TFileInfo>.Create;
+  TempList.AddRange(FFileList);
+  try
+    TempList.Sort(
+      TComparer<TFileInfo>.Construct(
+        function(const Left, Right: TFileInfo): Integer
+        begin
+          Result := Sign(Right.Diff - Left.Diff);
+        end));
+
+    if TempList.Count > 0 then
+    begin
+      MidIndex := TempList.Count div 2;
+      if (TempList.Count mod 2) = 1 then
+        FMedian := TempList[MidIndex].Diff
+      else
+        FMedian := (TempList[MidIndex - 1].Diff + TempList[MidIndex].Diff) div 2;
+    end;
+  finally
+    TempList.Free;
+  end;
+
+  // Sort back by time for correct display order
+  FFileList.Sort(
+    TComparer<TFileInfo>.Construct(
+      function(const Left, Right: TFileInfo): Integer
+      begin
+        Result := Sign(Right.Diff - Left.Diff);
+      end));
+end;
+
+function TDcuAnalyzer.GetNamespaceStats(const AFileList: TList<TFileInfo>): TDictionary<string, TNamespaceInfo>;
+var
+  FileName       : String;
+  FileRec        : TFileInfo;
+  Info           : TNamespaceInfo;
+  NamespacePrefix: String;
+  Parts          : TArray<String>;
+  SourceList     : TList<TFileInfo>;
+begin
+  Result := TDictionary<String, TNamespaceInfo>.Create;
+
+  if Assigned(AFileList) then
+    SourceList := AFileList
+  else
+    SourceList := FFileList;
+
+  for FileRec in SourceList do
+  begin
+    if FileRec.Diff <= 0 then
+      Continue;
+
+    FileName := TPath.GetFileNameWithoutExtension(FileRec.Path);
+    Parts := FileName.Split(['.']);
+    if Length(Parts) <= 1 then
+      Continue;
+
+    for var Loop: Integer := 0 to High(Parts) do
+    begin
+      if Loop > 0 then
+        NamespacePrefix := NamespacePrefix + '.' + Parts[Loop]
+      else
+        NamespacePrefix := Parts[Loop];
+
+      if Result.TryGetValue(NamespacePrefix, Info) then
+      begin
+        Info.TotalTime := Info.TotalTime + FileRec.Diff;
+        Inc(Info.FileCount);
+        Result[NamespacePrefix]:=Info;
+      end
+      else
+      begin
+        Info.TotalTime := FileRec.Diff;
+        Info.FileCount := 1;
+        Result.Add(NamespacePrefix, Info);
+      end;
+    end;
+  end;
+end;
+
+function TDcuAnalyzer.IsIncompleteBuild: Boolean;
+begin
+  Result := False;
+
+  if (FFileList.Count < 2) or (FMedian <= 0) then
+    Exit;
+
+  // Find the first gap, which is a diff that is much larger than the median
+  for var I: Integer := 0 to FFileList.Count - 2 do
+  begin
+    // Heuristic: A gap is a diff > 100x the median, and also at least 10 seconds absolute.
+    if (FFileList[I].Diff > FMedian * 100) and (FFileList[I].Diff > TicksPerMillisecond * 10000) then
+      Exit(True);
+  end;
+end;
+
+end.
